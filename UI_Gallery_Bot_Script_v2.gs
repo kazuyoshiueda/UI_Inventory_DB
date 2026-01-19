@@ -28,6 +28,8 @@ function processNewImages() {
   }
 
   const startTime = new Date().getTime();
+
+  // ★相対パスでスプレッドシート取得
   let ss;
   try {
     ss = getRelativeSpreadsheet();
@@ -35,9 +37,11 @@ function processNewImages() {
     console.error(e.message);
     return;
   }
+
   const configSheet = ss.getSheetByName(CONFIG_SHEET_NAME);
 
   try {
+    // --- 1. スイッチ確認 ---
     if (configSheet) {
       const switchStatus = configSheet.getRange(2, 2).getValue();
       if (switchStatus !== "ON") {
@@ -49,6 +53,8 @@ function processNewImages() {
 
     const sheet = ss.getSheetByName(SHEET_NAME);
     const masterSheet = ss.getSheetByName(SCREEN_MASTER_SHEET_NAME);
+
+    // ★相対パスでInboxフォルダ取得
     let inboxFolder;
     try {
       inboxFolder = getRelativeInboxFolder();
@@ -59,7 +65,7 @@ function processNewImages() {
 
     const promptInstructions = loadPromptMasterInstructions(ss);
 
-    // --- 1. Masterから未処理リスト (targetIds) を作成 ---
+    // --- 2. Masterから未処理リスト (targetIds) を作成 ---
     const masterData = masterSheet.getDataRange().getValues();
     const idColIdx = masterData[0].indexOf("Screen_ID");
     const dateColIdx = masterData[0].indexOf("Last_Processed");
@@ -68,29 +74,29 @@ function processNewImages() {
       throw new Error("Screen_Masterに Screen_ID または Last_Processed 列がありません。");
     }
 
-    const targetIds = []; // ここで targetIds を定義
+    const targetIds = [];
     for (let i = 1; i < masterData.length; i++) {
       if (masterData[i][idColIdx] && !masterData[i][dateColIdx]) {
         targetIds.push({ row: i + 1, id: String(masterData[i][idColIdx]) });
       }
     }
 
-    updateStatusMessage(configSheet, `🚀 起動中... 対象: ${targetIds.length} 画面`);
+    // ★【プランB】起動メッセージの表示（高速版）
+    updateStatusMessage(configSheet, `🚀 起動中... 残り ${targetIds.length} 画面`);
 
-    // --- 2. 既登録チェック用リスト作成 ---
+    // --- 3. 既登録チェック用リスト作成 ---
     const galleryData = sheet.getDataRange().getValues();
     const registeredPaths = new Set();
     for (let i = 1; i < galleryData.length; i++) {
       if (galleryData[i][1]) registeredPaths.add(String(galleryData[i][1]));
     }
 
-    // --- 3. 共通変数の準備 ---
+    // --- 4. 処理ループ (鉄壁の完遂フラグ版) ---
     let processedTotal = 0;
     let timeLimitReached = false;
     let hasFilesRemaining = false;
     const rootFolderName = inboxFolder.getName();
 
-    // --- 4. 処理ループ (鉄壁の完遂フラグ版) ---
     for (const target of targetIds) {
       if (timeLimitReached) {
         hasFilesRemaining = true;
@@ -105,44 +111,49 @@ function processNewImages() {
       if (folder.getName().startsWith("🚫")) continue;
 
       const files = folder.getFiles();
-      let isFolderFullyProcessed = true; // 完遂フラグ
+
+      // ★フォルダ開始時に「完遂フラグ」を立てる
+      let isFolderFullyProcessed = true;
 
       while (files.hasNext()) {
         const currentTime = new Date().getTime();
         if ((currentTime - startTime) / 1000 > MAX_EXECUTION_TIME_SEC) {
           timeLimitReached = true;
           hasFilesRemaining = true;
-          isFolderFullyProcessed = false;
+          isFolderFullyProcessed = false; // 未完としてマーク
           break;
         }
 
         const file = files.next();
+        const fileName = file.getName();
         if (!file.getMimeType().includes("image")) continue;
 
-        const relativePath = `${rootFolderName}/${screenId}/${file.getName()}`;
+        const relativePath = `${rootFolderName}/${screenId}/${fileName}`;
         if (registeredPaths.has(relativePath)) continue;
 
         if (processedTotal % 3 === 0) {
           updateStatusMessage(configSheet, `🔄 処理中... (${processedTotal}完了)`);
         }
 
-        console.log(`Processing [${screenId}] ${file.getName()}...`);
+        console.log(`Processing [${screenId}] ${fileName}...`);
 
         try {
           const result = callGeminiVisionAPI_Dynamic(file.getBlob(), promptInstructions);
           const uniqueId = Utilities.getUuid().slice(0, 8);
           const today = new Date();
 
-          // 書き込み (13番目に today を配置)
+          // 書き込み (Created_Date列が13番目の想定で、12番目に空文字を配置)
           sheet.appendRow([uniqueId, relativePath, screenId, result.category, "", result.specificName, result.tags, "", "", "", "", "", today, "", ""]);
 
           SpreadsheetApp.flush();
           registeredPaths.add(relativePath);
           processedTotal++;
-          Utilities.sleep(3000);
+          Utilities.sleep(3000); // 429エラー(API制限)対策
         } catch (e) {
-          console.error(`❌ Error in ${screenId}: ${e.message}`);
-          isFolderFullyProcessed = false;
+          console.error(`❌ Error in [${screenId}] ${fileName}: ${e.message}`);
+          isFolderFullyProcessed = false; // 1つでもコケたらこのフォルダは「未完」
+
+          // API制限(429)の場合は中断
           if (e.message.includes("Resource exhausted")) {
             timeLimitReached = true;
             break;
@@ -150,18 +161,21 @@ function processNewImages() {
         }
       }
 
-      // 完遂時のみ日付を記入
+      // --- 判定：フォルダ内が完全に完了した時だけ日付を記入 ---
       if (isFolderFullyProcessed) {
         masterSheet.getRange(target.row, dateColIdx + 1).setValue(new Date());
         SpreadsheetApp.flush();
+        console.log(`✅ ${screenId} の全画像を処理完了`);
       }
     }
 
     // --- 5. 終了処理 ---
     if (!timeLimitReached && !hasFilesRemaining) {
-      if (processedTotal === 0) {
+      if (processedTotal === 0 && !timeLimitReached) {
+        console.log(`🎉 完了。`);
         updateStatusMessage(configSheet, "");
         configSheet.getRange(2, 2).setValue("OFF");
+        SpreadsheetApp.flush();
       } else {
         updateStatusMessage(configSheet, `⏸ 一時停止。`);
       }
@@ -174,11 +188,11 @@ function processNewImages() {
     lock.releaseLock();
   }
 }
+
 // AppSheet連携用：再生成関数（安全版）
 function regenerateSingleImage(uniqueId, relativePath, customInstruction) {
   console.log(`★再生成開始: ID=${uniqueId}`);
 
-  // 1. パス分解
   const pathParts = relativePath.split("/");
   if (pathParts.length < 3) {
     console.error("❌ パス形式エラー");
@@ -187,7 +201,6 @@ function regenerateSingleImage(uniqueId, relativePath, customInstruction) {
   const folderName = pathParts[1];
   const fileName = pathParts[2];
 
-  // ★相対パスでスプレッドシート取得
   let ss;
   try {
     ss = getRelativeSpreadsheet();
@@ -198,10 +211,7 @@ function regenerateSingleImage(uniqueId, relativePath, customInstruction) {
   const sheet = ss.getSheetByName(SHEET_NAME);
 
   try {
-    // ★相対パスでInbox取得
     const inbox = getRelativeInboxFolder();
-
-    // 2. ターゲット特定（全体検索せず、階層を辿る）
     const targetFolders = inbox.getFoldersByName(folderName);
     if (!targetFolders.hasNext()) {
       console.error(`❌ フォルダなし: ${folderName}`);
@@ -216,10 +226,8 @@ function regenerateSingleImage(uniqueId, relativePath, customInstruction) {
     }
     const file = files.next();
 
-    // 3. 実行
     const result = callGeminiVisionAPI_Dynamic(file.getBlob(), customInstruction);
 
-    // 4. 書き込み位置特定
     const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
     const colMap = {};
     headers.forEach((h, i) => (colMap[h] = i + 1));
@@ -250,10 +258,9 @@ function regenerateSingleImage(uniqueId, relativePath, customInstruction) {
 }
 
 // ==========================================
-// ★ヘルパー関数（相対パス・その他）
+// ★ヘルパー関数
 // ==========================================
 
-// 自分と同じフォルダにある "_INBOX" を取得
 function getRelativeInboxFolder() {
   const parent = DriveApp.getFileById(ScriptApp.getScriptId()).getParents().next();
   const folders = parent.getFoldersByName("_INBOX");
@@ -261,7 +268,6 @@ function getRelativeInboxFolder() {
   return folders.next();
 }
 
-// 自分と同じフォルダにある スプレッドシート を取得
 function getRelativeSpreadsheet() {
   const parent = DriveApp.getFileById(ScriptApp.getScriptId()).getParents().next();
   const files = parent.getFilesByName(SPREADSHEET_FILE_NAME);
@@ -283,8 +289,6 @@ function loadPromptMasterInstructions(ss) {
 }
 
 function callGeminiVisionAPI_Dynamic(imageBlob, instructionBlock) {
-  // const model = 'gemini-2.0-flash-exp';
-  // エラー推奨のモデル、または安定版の1.5 Flashに変更
   const model = "gemini-2.0-flash";
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${API_KEY}`;
   const finalPrompt = `
@@ -329,14 +333,4 @@ function updateStatusMessage(configSheet, message) {
       SpreadsheetApp.flush();
     } catch (e) {}
   }
-}
-
-function countFilesRoughly(folder) {
-  let count = 0;
-  const files = folder.getFiles();
-  while (files.hasNext()) {
-    count++;
-    files.next();
-  }
-  return count;
 }
