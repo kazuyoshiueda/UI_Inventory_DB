@@ -28,8 +28,6 @@ function processNewImages() {
   }
 
   const startTime = new Date().getTime();
-
-  // ★相対パスでスプレッドシート取得
   let ss;
   try {
     ss = getRelativeSpreadsheet();
@@ -37,11 +35,9 @@ function processNewImages() {
     console.error(e.message);
     return;
   }
-
   const configSheet = ss.getSheetByName(CONFIG_SHEET_NAME);
 
   try {
-    // --- 1. スイッチ確認 ---
     if (configSheet) {
       const switchStatus = configSheet.getRange(2, 2).getValue();
       if (switchStatus !== "ON") {
@@ -53,8 +49,6 @@ function processNewImages() {
 
     const sheet = ss.getSheetByName(SHEET_NAME);
     const masterSheet = ss.getSheetByName(SCREEN_MASTER_SHEET_NAME);
-
-    // ★相対パスでInboxフォルダ取得
     let inboxFolder;
     try {
       inboxFolder = getRelativeInboxFolder();
@@ -64,41 +58,39 @@ function processNewImages() {
     }
 
     const promptInstructions = loadPromptMasterInstructions(ss);
-    const initialRemaining = countFilesRoughly(inboxFolder);
-    updateStatusMessage(configSheet, `🚀 起動中... 残り約 ${initialRemaining} 件`);
 
-    // --- 2. Masterロード (未処理リスト作成) ---
+    // --- 1. Masterから未処理リスト (targetIds) を作成 ---
     const masterData = masterSheet.getDataRange().getValues();
-    const idColIndex = masterData[0].indexOf("Screen_ID");
-    const dateColIndex = masterData[0].indexOf("Last_Processed"); // 新設列：B列を想定
+    const idColIdx = masterData[0].indexOf("Screen_ID");
+    const dateColIdx = masterData[0].indexOf("Last_Processed");
 
-    if (idColIndex === -1 || dateColIndex === -1) {
+    if (idColIdx === -1 || dateColIdx === -1) {
       throw new Error("Screen_Masterに Screen_ID または Last_Processed 列がありません。");
     }
 
-    const targetRows = [];
+    const targetIds = []; // ここで targetIds を定義
     for (let i = 1; i < masterData.length; i++) {
-      if (masterData[i][idColIndex] && !masterData[i][dateColIndex]) {
-        targetRows.push({ row: i + 1, id: String(masterData[i][idColIndex]) });
+      if (masterData[i][idColIdx] && !masterData[i][dateColIdx]) {
+        targetIds.push({ row: i + 1, id: String(masterData[i][idColIdx]) });
       }
     }
 
-    // --- 3. 既登録チェック用リスト ---
+    updateStatusMessage(configSheet, `🚀 起動中... 対象: ${targetIds.length} 画面`);
+
+    // --- 2. 既登録チェック用リスト作成 ---
     const galleryData = sheet.getDataRange().getValues();
     const registeredPaths = new Set();
-    const imageColIndex = 1;
     for (let i = 1; i < galleryData.length; i++) {
-      const path = galleryData[i][imageColIndex];
-      if (path) registeredPaths.add(String(path));
+      if (galleryData[i][1]) registeredPaths.add(String(galleryData[i][1]));
     }
 
-    // --- 4. 処理ループ ---
+    // --- 3. 共通変数の準備 ---
     let processedTotal = 0;
     let timeLimitReached = false;
     let hasFilesRemaining = false;
     const rootFolderName = inboxFolder.getName();
 
-    // --- 処理ループ ---
+    // --- 4. 処理ループ (鉄壁の完遂フラグ版) ---
     for (const target of targetIds) {
       if (timeLimitReached) {
         hasFilesRemaining = true;
@@ -110,56 +102,47 @@ function processNewImages() {
       if (!folders.hasNext()) continue;
 
       const folder = folders.next();
-      const folderName = folder.getName();
-      if (folderName.startsWith("🚫")) continue;
+      if (folder.getName().startsWith("🚫")) continue;
 
       const files = folder.getFiles();
-
-      // ★フォルダ開始時に「完遂フラグ」を立てる
-      let isFolderFullyProcessed = true;
+      let isFolderFullyProcessed = true; // 完遂フラグ
 
       while (files.hasNext()) {
         const currentTime = new Date().getTime();
-        // 1. 時間制限チェック
         if ((currentTime - startTime) / 1000 > MAX_EXECUTION_TIME_SEC) {
           timeLimitReached = true;
           hasFilesRemaining = true;
-          isFolderFullyProcessed = false; // 未完としてマーク
+          isFolderFullyProcessed = false;
           break;
         }
 
         const file = files.next();
-        const fileName = file.getName();
         if (!file.getMimeType().includes("image")) continue;
 
-        const relativePath = `${rootFolderName}/${screenId}/${fileName}`;
+        const relativePath = `${rootFolderName}/${screenId}/${file.getName()}`;
         if (registeredPaths.has(relativePath)) continue;
 
         if (processedTotal % 3 === 0) {
           updateStatusMessage(configSheet, `🔄 処理中... (${processedTotal}完了)`);
         }
 
-        console.log(`Processing [${screenId}] ${fileName}...`);
+        console.log(`Processing [${screenId}] ${file.getName()}...`);
 
         try {
           const result = callGeminiVisionAPI_Dynamic(file.getBlob(), promptInstructions);
           const uniqueId = Utilities.getUuid().slice(0, 8);
           const today = new Date();
 
-          // 2. 書き込み処理（ズレ修正済み）
+          // 書き込み (13番目に today を配置)
           sheet.appendRow([uniqueId, relativePath, screenId, result.category, "", result.specificName, result.tags, "", "", "", "", "", today, "", ""]);
 
           SpreadsheetApp.flush();
           registeredPaths.add(relativePath);
           processedTotal++;
-          Utilities.sleep(3000); // 429エラー(API制限)対策
+          Utilities.sleep(3000);
         } catch (e) {
-          // 3. 全てのエラー（API制限、通信、フィルタリング等）をここでキャッチ
-          console.error(`❌ Error in Screen [${screenId}] File [${fileName}]: ${e.message}`);
-
-          isFolderFullyProcessed = false; // 1つでもコケたらこのフォルダは「未完」
-
-          // API制限(429)の場合は、連続で失敗する可能性が高いのでこの回の実行を中断
+          console.error(`❌ Error in ${screenId}: ${e.message}`);
+          isFolderFullyProcessed = false;
           if (e.message.includes("Resource exhausted")) {
             timeLimitReached = true;
             break;
@@ -167,23 +150,18 @@ function processNewImages() {
         }
       }
 
-      // --- 判定：フォルダ内の全ファイルがエラーなく完了した時だけ日付を記入 ---
+      // 完遂時のみ日付を記入
       if (isFolderFullyProcessed) {
         masterSheet.getRange(target.row, dateColIdx + 1).setValue(new Date());
-        console.log(`✅ Folder Fully Processed: ${screenId}`);
         SpreadsheetApp.flush();
-      } else {
-        console.warn(`⚠️ Folder Incomplete (will retry later): ${screenId}`);
       }
     }
 
     // --- 5. 終了処理 ---
     if (!timeLimitReached && !hasFilesRemaining) {
-      if (processedTotal === 0 && !timeLimitReached) {
-        console.log(`🎉 完了。`);
+      if (processedTotal === 0) {
         updateStatusMessage(configSheet, "");
         configSheet.getRange(2, 2).setValue("OFF");
-        SpreadsheetApp.flush();
       } else {
         updateStatusMessage(configSheet, `⏸ 一時停止。`);
       }
@@ -196,7 +174,6 @@ function processNewImages() {
     lock.releaseLock();
   }
 }
-
 // AppSheet連携用：再生成関数（安全版）
 function regenerateSingleImage(uniqueId, relativePath, customInstruction) {
   console.log(`★再生成開始: ID=${uniqueId}`);
