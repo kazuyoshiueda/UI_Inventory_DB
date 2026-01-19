@@ -98,7 +98,8 @@ function processNewImages() {
     let hasFilesRemaining = false;
     const rootFolderName = inboxFolder.getName();
 
-    for (const target of targetRows) {
+    // --- 処理ループ ---
+    for (const target of targetIds) {
       if (timeLimitReached) {
         hasFilesRemaining = true;
         break;
@@ -114,11 +115,16 @@ function processNewImages() {
 
       const files = folder.getFiles();
 
+      // ★フォルダ開始時に「完遂フラグ」を立てる
+      let isFolderFullyProcessed = true;
+
       while (files.hasNext()) {
         const currentTime = new Date().getTime();
+        // 1. 時間制限チェック
         if ((currentTime - startTime) / 1000 > MAX_EXECUTION_TIME_SEC) {
           timeLimitReached = true;
           hasFilesRemaining = true;
+          isFolderFullyProcessed = false; // 未完としてマーク
           break;
         }
 
@@ -140,20 +146,34 @@ function processNewImages() {
           const uniqueId = Utilities.getUuid().slice(0, 8);
           const today = new Date();
 
+          // 2. 書き込み処理（ズレ修正済み）
           sheet.appendRow([uniqueId, relativePath, screenId, result.category, "", result.specificName, result.tags, "", "", "", "", "", today, "", ""]);
+
           SpreadsheetApp.flush();
           registeredPaths.add(relativePath);
           processedTotal++;
-          Utilities.sleep(3000);
+          Utilities.sleep(3000); // 429エラー(API制限)対策
         } catch (e) {
-          console.error(`❌ Error: ${e.message}`);
+          // 3. 全てのエラー（API制限、通信、フィルタリング等）をここでキャッチ
+          console.error(`❌ Error in Screen [${screenId}] File [${fileName}]: ${e.message}`);
+
+          isFolderFullyProcessed = false; // 1つでもコケたらこのフォルダは「未完」
+
+          // API制限(429)の場合は、連続で失敗する可能性が高いのでこの回の実行を中断
+          if (e.message.includes("Resource exhausted")) {
+            timeLimitReached = true;
+            break;
+          }
         }
       }
 
-      // フォルダ内すべてのチェック完了後、Masterに日付を記入
-      if (!timeLimitReached) {
-        masterSheet.getRange(target.row, dateColIndex + 1).setValue(new Date());
+      // --- 判定：フォルダ内の全ファイルがエラーなく完了した時だけ日付を記入 ---
+      if (isFolderFullyProcessed) {
+        masterSheet.getRange(target.row, dateColIdx + 1).setValue(new Date());
+        console.log(`✅ Folder Fully Processed: ${screenId}`);
         SpreadsheetApp.flush();
+      } else {
+        console.warn(`⚠️ Folder Incomplete (will retry later): ${screenId}`);
       }
     }
 
