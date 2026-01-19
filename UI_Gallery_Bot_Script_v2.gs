@@ -63,22 +63,35 @@ function processNewImages() {
       return;
     }
 
-    const promptInstructions = loadPromptMasterInstructions(ss);
-
-    // --- 2. Masterから未処理リスト (targetIds) を作成 ---
+    // --- 1. Masterから未処理リスト (targetIds) を作成 ---
     const masterData = masterSheet.getDataRange().getValues();
     const idColIdx = masterData[0].indexOf("Screen_ID");
     const dateColIdx = masterData[0].indexOf("Last_Processed");
+    const statusColIdx = masterData[0].indexOf("Processing_Status"); // ★追加
 
-    if (idColIdx === -1 || dateColIdx === -1) {
-      throw new Error("Screen_Masterに Screen_ID または Last_Processed 列がありません。");
+    // インデックスが見つからない場合の安全策
+    if (idColIdx === -1 || dateColIdx === -1 || statusColIdx === -1) {
+      throw new Error("Screen_Masterの列名(Screen_ID, Last_Processed, Processing_Status)を確認してください。");
     }
 
     const targetIds = [];
     for (let i = 1; i < masterData.length; i++) {
-      if (masterData[i][idColIdx] && !masterData[i][dateColIdx]) {
+      // ★修正：日付の有無ではなく、Statusが「未処理」かどうかで判定
+      if (masterData[i][idColIdx] && masterData[i][statusColIdx] === "未処理") {
         targetIds.push({ row: i + 1, id: String(masterData[i][idColIdx]) });
       }
+    }
+
+    // --- 判定：フォルダ内が完全に完了した時だけ記入 ---
+    if (isFolderFullyProcessed) {
+      // Last_Processed列に日付
+      masterSheet.getRange(target.row, dateColIdx + 1).setValue(new Date());
+
+      // Processing_Status列に「処理済」
+      masterSheet.getRange(target.row, statusColIdx + 1).setValue("処理済");
+
+      SpreadsheetApp.flush();
+      console.log(`✅ ${screenId} の全画像を処理完了`);
     }
 
     // ★【プランB】起動メッセージの表示（高速版）
