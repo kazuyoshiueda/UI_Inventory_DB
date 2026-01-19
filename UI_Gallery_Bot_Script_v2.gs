@@ -67,12 +67,20 @@ function processNewImages() {
     const initialRemaining = countFilesRoughly(inboxFolder);
     updateStatusMessage(configSheet, `🚀 起動中... 残り約 ${initialRemaining} 件`);
 
-    // --- 2. Masterロード (ID検証用) ---
+    // --- 2. Masterロード (未処理リスト作成) ---
     const masterData = masterSheet.getDataRange().getValues();
     const idColIndex = masterData[0].indexOf("Screen_ID");
-    const validScreenIds = new Set();
+    const dateColIndex = masterData[0].indexOf("Last_Processed"); // 新設列：B列を想定
+
+    if (idColIndex === -1 || dateColIndex === -1) {
+      throw new Error("Screen_Masterに Screen_ID または Last_Processed 列がありません。");
+    }
+
+    const targetRows = [];
     for (let i = 1; i < masterData.length; i++) {
-      if (masterData[i][idColIndex]) validScreenIds.add(String(masterData[i][idColIndex]));
+      if (masterData[i][idColIndex] && !masterData[i][dateColIndex]) {
+        targetRows.push({ row: i + 1, id: String(masterData[i][idColIndex]) });
+      }
     }
 
     // --- 3. 既登録チェック用リスト ---
@@ -85,29 +93,25 @@ function processNewImages() {
     }
 
     // --- 4. 処理ループ ---
-    const subFolders = inboxFolder.getFolders();
     let processedTotal = 0;
     let timeLimitReached = false;
     let hasFilesRemaining = false;
     const rootFolderName = inboxFolder.getName();
 
-    while (subFolders.hasNext()) {
+    for (const target of targetRows) {
       if (timeLimitReached) {
         hasFilesRemaining = true;
         break;
       }
 
-      const folder = subFolders.next();
+      const screenId = target.id;
+      const folders = inboxFolder.getFoldersByName(screenId);
+      if (!folders.hasNext()) continue;
+
+      const folder = folders.next();
       const folderName = folder.getName();
       if (folderName.startsWith("🚫")) continue;
 
-      if (!validScreenIds.has(folderName)) {
-        // ★修正: フォルダ名変更（書き込み）を行わずログのみにする
-        console.warn(`🚫[ID不一致] Skip: ${folderName}`);
-        continue;
-      }
-
-      const screenId = folderName;
       const files = folder.getFiles();
 
       while (files.hasNext()) {
@@ -136,15 +140,20 @@ function processNewImages() {
           const uniqueId = Utilities.getUuid().slice(0, 8);
           const today = new Date();
 
-          sheet.appendRow([uniqueId, relativePath, screenId, result.category, "", result.specificName, result.tags, "", "", "", "", today, "", ""]);
-
+          sheet.appendRow([uniqueId, relativePath, screenId, result.category, "", result.specificName, result.tags, "", "", "", "", "", today, "", ""]);
           SpreadsheetApp.flush();
           registeredPaths.add(relativePath);
           processedTotal++;
-          Utilities.sleep(500);
+          Utilities.sleep(3000);
         } catch (e) {
           console.error(`❌ Error: ${e.message}`);
         }
+      }
+
+      // フォルダ内すべてのチェック完了後、Masterに日付を記入
+      if (!timeLimitReached) {
+        masterSheet.getRange(target.row, dateColIndex + 1).setValue(new Date());
+        SpreadsheetApp.flush();
       }
     }
 
